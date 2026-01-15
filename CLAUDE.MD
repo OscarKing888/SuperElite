@@ -43,10 +43,12 @@ SuperElite/
 
 | 功能 | 参数 | 状态 |
 |------|------|:----:|
+| 版本显示 | `--version / -v` | ✅ |
 | 目录扫描 | `--dir <路径>` | ✅ |
 | 交互模式 | (无参数) | ✅ |
 | 双维度评分 | Quality + Aesthetic | ✅ |
 | 权重配置 | `--quality-weight / --aesthetic-weight` | ✅ |
+| 自定义阈值 | `--thresholds "78,72,66,58"` | ✅ |
 | XMP 写入 | `--write-xmp` | ✅ |
 | 星级分类 | `--organize --output <目录>` | ✅ |
 | CSV 导出 | `--csv <文件>` | ✅ |
@@ -56,10 +58,6 @@ SuperElite/
 ---
 
 ## 待开发功能
-
-### 必须实现
-- [ ] `--version` - 显示版本号
-- [ ] `--thresholds "78,72,66,58"` - 自定义星级阈值
 
 ### 待评估
 - [ ] `--workers N` - 多线程并行 (需测试效果)

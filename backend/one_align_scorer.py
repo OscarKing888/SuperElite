@@ -227,7 +227,7 @@ class OneAlignScorer:
         Returns:
             (rating, pick_flag, color_label)
 
-        新阈值设计（基于实际照片分布优化）：
+        默认阈值设计（基于实际照片分布优化）：
         - 4星 (≥78): 顶级照片，约占10-15%
         - 3星 (≥72): 优秀照片，约占20-25%
         - 2星 (≥66): 中等照片，约占30-40% (大部分照片)
@@ -238,13 +238,15 @@ class OneAlignScorer:
         - 只给 0 星照片标记 "rejected"
         - 其他星级不使用 picked 标签和颜色标签
         """
-        if total_score >= 78:
+        t4, t3, t2, t1 = _thresholds
+        
+        if total_score >= t4:
             return 4, "", ""
-        elif total_score >= 72:
+        elif total_score >= t3:
             return 3, "", ""
-        elif total_score >= 66:
+        elif total_score >= t2:
             return 2, "", ""
-        elif total_score >= 58:
+        elif total_score >= t1:
             return 1, "", ""
         else:
             return 0, "rejected", ""
@@ -255,8 +257,25 @@ class OneAlignScorer:
             self.load_model()
 
 
+# 全局阈值配置
+_thresholds = (78.0, 72.0, 66.0, 58.0)  # (4星, 3星, 2星, 1星)
+
 # 全局单例
 _scorer_instance = None
+
+
+def set_thresholds(t4: float, t3: float, t2: float, t1: float):
+    """
+    设置自定义星级阈值
+    
+    Args:
+        t4: 4星阈值 (≥t4 为4星)
+        t3: 3星阈值 (≥t3 为3星)
+        t2: 2星阈值 (≥t2 为2星)
+        t1: 1星阈值 (≥t1 为1星，<t1 为0星)
+    """
+    global _thresholds
+    _thresholds = (t4, t3, t2, t1)
 
 
 def get_one_align_scorer(

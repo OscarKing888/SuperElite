@@ -10,13 +10,62 @@ import platform
 import argparse
 import json
 import shutil
+import subprocess
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple
 from tqdm import tqdm
 
-from one_align_scorer import get_one_align_scorer
+from one_align_scorer import get_one_align_scorer, set_thresholds
 from exif_writer import get_exif_writer
 from raw_converter import is_raw_file, raw_to_jpeg
+
+# 版本信息
+VERSION = "1.0"
+
+
+def get_git_hash() -> str:
+    """获取最后一次 git commit 的短 hash"""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=Path(__file__).parent.parent,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def print_version():
+    """打印版本信息"""
+    git_hash = get_git_hash()
+    print(f"SuperElite v{VERSION} (commit: {git_hash})")
+
+
+def parse_thresholds(thresholds_str: str) -> Tuple[float, float, float, float]:
+    """
+    解析阈值字符串
+    
+    Args:
+        thresholds_str: 格式 "78,72,66,58" (4星,3星,2星,1星)
+    
+    Returns:
+        (t4, t3, t2, t1) 阈值元组
+    """
+    try:
+        parts = [float(x.strip()) for x in thresholds_str.split(",")]
+        if len(parts) != 4:
+            raise ValueError("需要 4 个阈值")
+        if not all(parts[i] > parts[i+1] for i in range(3)):
+            raise ValueError("阈值必须递减 (4星 > 3星 > 2星 > 1星)")
+        return tuple(parts)
+    except Exception as e:
+        print(f"❌ 阈值格式错误: {e}")
+        print("   正确格式: --thresholds \"78,72,66,58\"")
+        sys.exit(1)
 
 
 def check_apple_silicon() -> bool:
@@ -215,10 +264,15 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
 
+    parser.add_argument("--version", "-v", action="store_true", help="显示版本号")
     parser.add_argument("--dir", type=str, help="输入目录 (RAW/JPEG)")
     parser.add_argument("--output", type=str, help="输出目录 (分星级)")
     parser.add_argument("--quality-weight", type=float, default=0.4, help="质量权重 (默认 0.4)")
     parser.add_argument("--aesthetic-weight", type=float, default=0.6, help="美学权重 (默认 0.6)")
+    parser.add_argument(
+        "--thresholds", type=str, 
+        help='自定义星级阈值，格式: "78,72,66,58" (4星,3星,2星,1星)'
+    )
     parser.add_argument("--organize", action="store_true", help="按星级分目录")
     parser.add_argument("--write-xmp", action="store_true", help="写入 XMP 元数据")
     parser.add_argument("--csv", type=str, help="导出 CSV 报告路径")
@@ -226,12 +280,23 @@ def main():
 
     args = parser.parse_args()
 
+    # 版本检测
+    if args.version:
+        print_version()
+        sys.exit(0)
+
     # 硬件检测
     if args.check_hardware:
         validate_hardware()
         sys.exit(0)
 
     validate_hardware()
+
+    # 设置自定义阈值
+    if args.thresholds:
+        thresholds = parse_thresholds(args.thresholds)
+        set_thresholds(*thresholds)
+        print(f"✅ 使用自定义阈值: 4星≥{thresholds[0]}, 3星≥{thresholds[1]}, 2星≥{thresholds[2]}, 1星≥{thresholds[3]}")
 
     # 交互式输入目录 (如果未提供 --dir)
     input_dir = args.dir
