@@ -68,6 +68,126 @@ def parse_thresholds(thresholds_str: str) -> Tuple[float, float, float, float]:
         sys.exit(1)
 
 
+# 默认阈值
+DEFAULT_THRESHOLDS = (78.0, 72.0, 66.0, 58.0)
+
+
+def calculate_percentile_thresholds(scores: List[float]) -> Tuple[float, float, float, float]:
+    """
+    根据 20% 均分计算百分位阈值
+    
+    Args:
+        scores: 所有图片的综合分列表
+    
+    Returns:
+        (t4, t3, t2, t1) 阈值元组
+        - P80 -> 4星阈值
+        - P60 -> 3星阈值  
+        - P40 -> 2星阈值
+        - P20 -> 1星阈值
+    """
+    import numpy as np
+    
+    sorted_scores = np.array(sorted(scores))
+    
+    # 计算百分位点
+    t4 = float(np.percentile(sorted_scores, 80))  # P80: 前 20% 为 4星
+    t3 = float(np.percentile(sorted_scores, 60))  # P60: 20-40% 为 3星
+    t2 = float(np.percentile(sorted_scores, 40))  # P40: 40-60% 为 2星
+    t1 = float(np.percentile(sorted_scores, 20))  # P20: 60-80% 为 1星, <P20 为 0星
+    
+    return (round(t4, 1), round(t3, 1), round(t2, 1), round(t1, 1))
+
+
+def prompt_threshold_confirmation(
+    suggested: Tuple[float, float, float, float],
+    counts: Dict[int, int],
+    stats: Dict[str, float],
+) -> Tuple[float, float, float, float]:
+    """
+    提示用户确认阈值
+    
+    Args:
+        suggested: 建议阈值 (t4, t3, t2, t1)
+        counts: 各星级数量
+        stats: 分数统计 {max, min, avg}
+    
+    Returns:
+        最终确认的阈值
+    """
+    t4, t3, t2, t1 = suggested
+    
+    print("\n" + "=" * 60)
+    print("📊 分数分布分析:")
+    print(f"   最高分: {stats['max']:.1f}  |  最低分: {stats['min']:.1f}  |  平均: {stats['avg']:.1f}")
+    print()
+    print("📐 根据 20% 均分，建议阈值:")
+    print(f"   4★ ≥ {t4} ({counts[4]}张)  |  3★ ≥ {t3} ({counts[3]}张)")
+    print(f"   2★ ≥ {t2} ({counts[2]}张)  |  1★ ≥ {t1} ({counts[1]}张)")
+    print(f"   0★  < {t1} ({counts[0]}张)")
+    print("=" * 60)
+    
+    while True:
+        choice = input("\n是否使用此阈值？ [Y]使用建议 / [N]使用默认 / [C]自定义: ").strip().upper()
+        
+        if choice == "Y" or choice == "":
+            print(f"✅ 使用建议阈值: {t4}, {t3}, {t2}, {t1}")
+            return suggested
+        
+        elif choice == "N":
+            print(f"✅ 使用默认阈值: {DEFAULT_THRESHOLDS[0]}, {DEFAULT_THRESHOLDS[1]}, {DEFAULT_THRESHOLDS[2]}, {DEFAULT_THRESHOLDS[3]}")
+            return DEFAULT_THRESHOLDS
+        
+        elif choice == "C":
+            return prompt_custom_thresholds(suggested)
+        
+        else:
+            print("❌ 无效输入，请输入 Y/N/C")
+
+
+def prompt_custom_thresholds(
+    suggested: Tuple[float, float, float, float]
+) -> Tuple[float, float, float, float]:
+    """
+    让用户逐个调整阈值
+    
+    Args:
+        suggested: 建议阈值
+    
+    Returns:
+        用户调整后的阈值
+    """
+    t4, t3, t2, t1 = suggested
+    result = []
+    
+    labels = [("4★", t4), ("3★", t3), ("2★", t2), ("1★", t1)]
+    
+    print("\n🛠️  自定义阈值 (直接回车保持建议值):")
+    
+    for label, default in labels:
+        while True:
+            user_input = input(f"   {label} 阈值 [默认 {default}]: ").strip()
+            
+            if user_input == "":
+                result.append(default)
+                break
+            
+            try:
+                value = float(user_input)
+                # 检查递减顺序
+                if result and value >= result[-1]:
+                    print(f"   ❌ 阈值必须递减 (当前值必须小于 {result[-1]})")
+                    continue
+                result.append(value)
+                break
+            except ValueError:
+                print("   ❌ 请输入有效数字")
+    
+    final = tuple(result)
+    print(f"\n✅ 使用自定义阈值: {final[0]}, {final[1]}, {final[2]}, {final[3]}")
+    return final
+
+
 def check_apple_silicon() -> bool:
     """检测是否为 Apple Silicon Mac"""
     if platform.system() != "Darwin":
@@ -257,6 +377,62 @@ def process_batch(
     return results
 
 
+def remap_ratings(
+    results: List[Dict],
+    thresholds: Tuple[float, float, float, float],
+) -> List[Dict]:
+    """
+    根据新阈值重新映射星级
+    
+    Args:
+        results: 评分结果列表
+        thresholds: (t4, t3, t2, t1) 阈值
+    
+    Returns:
+        更新后的结果列表
+    """
+    t4, t3, t2, t1 = thresholds
+    
+    for result in results:
+        if "error" in result:
+            continue
+        
+        total = result["total"]
+        
+        if total >= t4:
+            result["rating"] = 4
+            result["pick_flag"] = ""
+            result["color_label"] = ""
+        elif total >= t3:
+            result["rating"] = 3
+            result["pick_flag"] = ""
+            result["color_label"] = ""
+        elif total >= t2:
+            result["rating"] = 2
+            result["pick_flag"] = ""
+            result["color_label"] = ""
+        elif total >= t1:
+            result["rating"] = 1
+            result["pick_flag"] = ""
+            result["color_label"] = ""
+        else:
+            result["rating"] = 0
+            result["pick_flag"] = "rejected"
+            result["color_label"] = ""
+    
+    return results
+
+
+def count_by_rating(results: List[Dict]) -> Dict[int, int]:
+    """统计各星级数量"""
+    counts = {4: 0, 3: 0, 2: 0, 1: 0, 0: 0}
+    for r in results:
+        if "error" not in r:
+            rating = r.get("rating", 0)
+            counts[rating] = counts.get(rating, 0) + 1
+    return counts
+
+
 def main():
     """CLI 主入口"""
     parser = argparse.ArgumentParser(
@@ -272,6 +448,10 @@ def main():
     parser.add_argument(
         "--thresholds", type=str, 
         help='自定义星级阈值，格式: "78,72,66,58" (4星,3星,2星,1星)'
+    )
+    parser.add_argument(
+        "--auto-calibrate", action="store_true",
+        help="自动校准模式: 根据照片分布计算最佳阈值 (五等分)"
     )
     parser.add_argument("--organize", action="store_true", help="按星级分目录")
     parser.add_argument("--write-xmp", action="store_true", help="写入 XMP 元数据")
@@ -292,7 +472,12 @@ def main():
 
     validate_hardware()
 
-    # 设置自定义阈值
+    # 检查参数冲突
+    if args.thresholds and args.auto_calibrate:
+        print("❌ --thresholds 和 --auto-calibrate 不能同时使用")
+        sys.exit(1)
+
+    # 设置自定义阈值 (仅当不使用 auto-calibrate 时)
     if args.thresholds:
         thresholds = parse_thresholds(args.thresholds)
         set_thresholds(*thresholds)
@@ -335,8 +520,50 @@ def main():
 
     exif_writer = get_exif_writer()
 
-    # 批量处理
-    results = process_batch(image_paths, scorer, exif_writer, write_xmp=args.write_xmp)
+    # Auto-calibrate 模式: 先评分，不写入，等用户确认阈值后再写入
+    if args.auto_calibrate:
+        # 第一步: 评分所有图片 (不写入 XMP)
+        results = process_batch(image_paths, scorer, exif_writer, write_xmp=False)
+        
+        # 提取所有分数
+        scores = [r["total"] for r in results if "error" not in r]
+        
+        if not scores:
+            print("❌ 没有有效的评分结果")
+            sys.exit(1)
+        
+        # 第二步: 计算建议阈值
+        suggested_thresholds = calculate_percentile_thresholds(scores)
+        
+        # 用建议阈值计算各星级数量 (用于显示)
+        temp_results = remap_ratings(results.copy(), suggested_thresholds)
+        counts = count_by_rating(temp_results)
+        
+        # 统计信息
+        stats = {
+            "max": max(scores),
+            "min": min(scores),
+            "avg": sum(scores) / len(scores),
+        }
+        
+        # 第三步: 用户确认
+        final_thresholds = prompt_threshold_confirmation(suggested_thresholds, counts, stats)
+        
+        # 第四步: 应用最终阈值，重新映射星级
+        results = remap_ratings(results, final_thresholds)
+        
+        # 第五步: 写入 XMP (如果指定了 --write-xmp)
+        if args.write_xmp:
+            print("\n📝 写入 XMP 元数据...")
+            write_xmp_metadata(exif_writer, results)
+        
+        # 统计
+        success = len([r for r in results if "error" not in r])
+        print(f"\n✅ 完成! 成功: {success}/{len(results)}")
+    
+    else:
+        # 标准模式: 使用默认/自定义阈值，直接处理
+        results = process_batch(image_paths, scorer, exif_writer, write_xmp=args.write_xmp)
 
     # 按星级分目录
     if args.organize and args.output:
@@ -350,13 +577,7 @@ def main():
     summary = {
         "total": len(results),
         "success": len([r for r in results if "error" not in r]),
-        "by_rating": {
-            "4-star": len([r for r in results if r.get("rating") == 4]),
-            "3-star": len([r for r in results if r.get("rating") == 3]),
-            "2-star": len([r for r in results if r.get("rating") == 2]),
-            "1-star": len([r for r in results if r.get("rating") == 1]),
-            "0-star": len([r for r in results if r.get("rating") == 0]),
-        },
+        "by_rating": count_by_rating(results),
     }
 
     print(f"\n📊 统计摘要:")

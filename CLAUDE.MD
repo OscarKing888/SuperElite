@@ -49,6 +49,7 @@ SuperElite/
 | 双维度评分 | Quality + Aesthetic | ✅ |
 | 权重配置 | `--quality-weight / --aesthetic-weight` | ✅ |
 | 自定义阈值 | `--thresholds "78,72,66,58"` | ✅ |
+| 自动校准 | `--auto-calibrate` (20%均分计算阈值) | ✅ |
 | XMP 写入 | `--write-xmp` | ✅ |
 | 星级分类 | `--organize --output <目录>` | ✅ |
 | CSV 导出 | `--csv <文件>` | ✅ |
