@@ -16,7 +16,6 @@ from PySide6.QtCore import QThread, Signal, QObject
 backend_path = Path(__file__).parent.parent / "backend"
 sys.path.insert(0, str(backend_path))
 
-from one_align_scorer import get_one_align_scorer, set_thresholds
 from exif_writer import get_exif_writer
 from raw_converter import is_raw_file, raw_to_jpeg, find_paired_jpg
 from preset_manager import get_preset_manager
@@ -66,6 +65,7 @@ class ScoringWorker(QThread):
         self._manifest = None  # ManifestManager 实例
         self.auto_calibrate = False
         self.confirmed_thresholds = None
+        self.model_mode = "basic"  # 新增：模型模式 "basic" 或 "advanced"
     
     def set_confirmed_thresholds(self, thresholds):
         """设置用户确认的阈值"""
@@ -82,6 +82,7 @@ class ScoringWorker(QThread):
         output_dir: Optional[str] = None,
         csv_path: Optional[str] = None,
         auto_calibrate: bool = False,
+        model_mode: str = "basic",  # 新增："basic" 或 "advanced"
     ):
         """配置评分参数"""
         self.input_dir = input_dir
@@ -94,6 +95,7 @@ class ScoringWorker(QThread):
         self.csv_path = csv_path
         self.auto_calibrate = auto_calibrate
         self.confirmed_thresholds = None  # 用户确认的阈值
+        self.model_mode = model_mode  # 新增：模型模式
     
     def stop(self):
         """请求停止处理"""
@@ -155,19 +157,35 @@ class ScoringWorker(QThread):
             
             # 步骤 3: 加载 AI 模型
             self.log_message.emit("info", "")
-            self.log_message.emit("info", "🤖 [步骤 3/4] 加载 AI 模型...")
+            if self.model_mode == "advanced":
+                self.log_message.emit("info", "🚀 [步骤 3/4] 加载 大师模型 (One-Align)...")
+            else:
+                self.log_message.emit("info", "⚡ [步骤 3/4] 加载 爱好者模型 (NIMA + TOPIQ)...")
             self.started_loading.emit()
             
-            set_thresholds(*self.thresholds)
-            self._scorer = get_one_align_scorer(
-                quality_weight=self.quality_weight,
-                aesthetic_weight=self.aesthetic_weight,
-            )
-            # 单例模式，模型在启动时已预加载和预热，这里直接使用
+            # 根据模式选择评分器
+            if self.model_mode == "advanced":
+                # 高级模式：使用 One-Align
+                from one_align_scorer import get_one_align_scorer, set_thresholds
+                set_thresholds(*self.thresholds)
+                self._scorer = get_one_align_scorer(
+                    quality_weight=self.quality_weight,
+                    aesthetic_weight=self.aesthetic_weight,
+                )
+            else:
+                # 基础模式：使用 NIMA + TOPIQ
+                from pyiqa_scorer import get_pyiqa_scorer, set_thresholds
+                set_thresholds(*self.thresholds)
+                self._scorer = get_pyiqa_scorer(
+                    quality_weight=self.quality_weight,
+                    aesthetic_weight=self.aesthetic_weight,
+                )
+            
             self._exif_writer = get_exif_writer()
             
             self.model_loaded.emit()
             self.log_message.emit("success", "   ✓ AI 模型就绪")
+
             
             # 步骤 4: 开始评分
             self.log_message.emit("info", "")

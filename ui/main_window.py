@@ -110,6 +110,8 @@ class SuperEliteMainWindow(QMainWindow):
         self._write_xmp = True
         self._organize = True  # 默认启用分目录
         self._last_preset_index = 0  # 预设下拉菜单选中索引 (0=auto)
+        self._model_mode = "basic"  # 模型模式: "basic" 或 "advanced"
+
         
         # 系统检查和模型下载
         if not self._check_system_requirements():
@@ -289,11 +291,13 @@ class SuperEliteMainWindow(QMainWindow):
         # 各区域
         self._create_header_section(main_layout)
         self._create_directory_section(main_layout)
-        self._create_preset_section(main_layout)  # 新：预设下拉菜单
-        self._create_weight_section(main_layout)  # 新：权重滑块
+        self._create_model_section(main_layout)  # 新：模型选择（爱好者/大师）
+        self._create_preset_section(main_layout)  # 预设下拉菜单
+        self._create_weight_section(main_layout)  # 权重滑块
         self._create_log_section(main_layout)
         self._create_progress_section(main_layout)
         self._create_button_section(main_layout)
+
 
     # ==================== Header 区域 ====================
     def _create_header_section(self, parent_layout):
@@ -386,6 +390,109 @@ class SuperEliteMainWindow(QMainWindow):
         layout.addWidget(browse_btn)
         
         parent_layout.addLayout(layout)
+
+    # ==================== 模型选择区域 ====================
+    def _create_model_section(self, parent_layout):
+        """创建模型选择区域 - 爱好者/大师"""
+        layout = QHBoxLayout()
+        layout.setSpacing(12)
+        
+        # 标签
+        label = QLabel("评分模型:")
+        label.setStyleSheet(f"color: {COLORS['text_secondary']}; font-size: 14px;")
+        label.setFixedWidth(90)
+        layout.addWidget(label)
+        
+        # 模型下拉菜单
+        self.model_combo = QComboBox()
+        self._update_model_combo()  # 初始化模型选项
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        layout.addWidget(self.model_combo, 1)
+        
+        # 模型下载按钮（仅当高级模型未下载时显示）
+        self.download_model_btn = QPushButton("下载高级模型")
+        self.download_model_btn.setObjectName("secondary")
+        self.download_model_btn.setFixedWidth(120)
+        self.download_model_btn.clicked.connect(self._on_download_advanced_model)
+        self.download_model_btn.setVisible(not self._is_advanced_model_available())
+        layout.addWidget(self.download_model_btn)
+        
+        parent_layout.addLayout(layout)
+    
+    def _is_advanced_model_available(self) -> bool:
+        """检查高级模型 (One-Align) 是否已下载"""
+        try:
+            from pathlib import Path
+            import sys
+            backend_path = Path(__file__).parent.parent / "backend"
+            sys.path.insert(0, str(backend_path))
+            from region_detector import is_model_cached
+            return is_model_cached()
+        except:
+            return False
+    
+    def _update_model_combo(self):
+        """更新模型下拉菜单选项"""
+        self.model_combo.blockSignals(True)
+        self.model_combo.clear()
+        
+        has_advanced = self._is_advanced_model_available()
+        
+        # 添加选项
+        self.model_combo.addItem("⚡ 爱好者 (NIMA + TOPIQ, 内置)")
+        self.model_combo.addItem("🚀 大师 (One-Align 15GB)" + ("" if has_advanced else " [未下载]"))
+        
+        # 默认选择：如果高级模型可用，默认使用大师模式
+        if has_advanced:
+            self.model_combo.setCurrentIndex(1)  # 大师
+            self._model_mode = "advanced"
+        else:
+            self.model_combo.setCurrentIndex(0)  # 爱好者
+            self._model_mode = "basic"
+        
+        self.model_combo.blockSignals(False)
+    
+    def _on_model_changed(self, index):
+        """模型选择变化"""
+        if index == 0:  # 爱好者
+            self._model_mode = "basic"
+            self._log("info", "⚡ 已切换到 爱好者 模式")
+            self._log("default", "   使用内置 NIMA + TOPIQ 模型，速度快")
+        else:  # 大师
+            if not self._is_advanced_model_available():
+                # 高级模型未下载，提示下载
+                StyledMessageBox.information(
+                    self,
+                    "需要下载模型",
+                    "🚀 大师模式需要下载 One-Align 模型 (~15GB)。\n\n"
+                    "点击「下载高级模型」按钮开始下载。"
+                )
+                # 切回爱好者模式
+                self.model_combo.blockSignals(True)
+                self.model_combo.setCurrentIndex(0)
+                self.model_combo.blockSignals(False)
+                self._model_mode = "basic"
+                return
+            
+            self._model_mode = "advanced"
+            self._log("info", "🚀 已切换到 大师 模式")
+            self._log("default", "   使用 One-Align 模型，质量+美学双维度评估")
+    
+    def _on_download_advanced_model(self):
+        """下载高级模型"""
+        from ui.download_source_dialog import DownloadSourceDialog
+        from region_detector import get_recommended_endpoint
+        
+        _, _, is_china = get_recommended_endpoint()
+        
+        dialog = DownloadSourceDialog(
+            recommended_is_china=is_china,
+            parent=self
+        )
+        
+        if dialog.exec():
+            endpoint = dialog.get_selected_endpoint()
+            self._start_model_download(endpoint)
 
     # ==================== 预设选择区域 ====================
     def _create_preset_section(self, parent_layout):
@@ -749,10 +856,12 @@ class SuperEliteMainWindow(QMainWindow):
             output_dir=dir_path,
             csv_path=None,
             auto_calibrate=self._auto_calibrate,
+            model_mode=self._model_mode,  # 新增：模型模式
         )
         
         # 开始处理
         self._start_processing()
+
     
     def _perform_reset_and_process(self, dir_path: str):
         """重置数据后重新处理"""
