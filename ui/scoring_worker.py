@@ -18,8 +18,9 @@ sys.path.insert(0, str(backend_path))
 
 from one_align_scorer import get_one_align_scorer, set_thresholds
 from exif_writer import get_exif_writer
-from raw_converter import is_raw_file, raw_to_jpeg
+from raw_converter import is_raw_file, raw_to_jpeg, find_paired_jpg
 from preset_manager import get_preset_manager
+from manifest_manager import ManifestManager, MANIFEST_FILENAME
 
 
 class ScoringWorker(QThread):
@@ -61,6 +62,7 @@ class ScoringWorker(QThread):
         self._should_stop = False
         self._scorer = None
         self._exif_writer = None
+        self._manifest = None  # ManifestManager 实例
         self.auto_calibrate = False
         self.confirmed_thresholds = None
     
@@ -101,17 +103,58 @@ class ScoringWorker(QThread):
         try:
             self._should_stop = False
             
-            # 1. 扫描目录
-            self.log_message.emit("info", f"📁 扫描目录: {self.input_dir}")
-            image_paths = self._scan_directory(self.input_dir)
+            # 显示任务开始
+            self.log_message.emit("info", "━" * 45)
+            self.log_message.emit("info", "🎯 开始 AI 评分任务")
+            self.log_message.emit("info", "━" * 45)
             
-            if not image_paths:
+            # 步骤 1: 扫描目录
+            self.log_message.emit("info", "")
+            self.log_message.emit("info", "📁 [步骤 1/4] 扫描目录...")
+            self.log_message.emit("info", f"   目录: {self.input_dir}")
+            all_image_paths = self._scan_directory(self.input_dir)
+            
+            if not all_image_paths:
                 self.error.emit("未找到图片文件")
                 return
             
-            self.log_message.emit("info", f"   找到 {len(image_paths)} 张图片")
+            self.log_message.emit("success", f"   ✓ 找到 {len(all_image_paths)} 张图片")
             
-            # 2. 获取模型 (已在启动时预加载)
+            # 步骤 2: 检查处理状态
+            self.log_message.emit("info", "")
+            self.log_message.emit("info", "📋 [步骤 2/4] 检查处理状态...")
+            
+            self._manifest = ManifestManager(self.input_dir)
+            self._manifest.set_config(
+                self.thresholds,
+                self.quality_weight,
+                self.aesthetic_weight,
+            )
+            self._manifest.set_total_files(len(all_image_paths))
+            
+            # 过滤出待处理文件（跳过已处理且未修改的）
+            image_paths = self._manifest.get_pending_files(all_image_paths)
+            skipped_count = len(all_image_paths) - len(image_paths)
+            
+            if skipped_count > 0:
+                self.log_message.emit("info", f"   ○ 跳过已处理: {skipped_count} 张")
+            
+            if not image_paths:
+                self.log_message.emit("success", "")
+                self.log_message.emit("success", "✅ 所有文件已处理完成，无需重新评分")
+                # 返回已有结果
+                summary = self._manifest.get_summary()
+                self.finished_scoring.emit([], summary)
+                return
+            
+            self.log_message.emit("success", f"   ✓ 待处理: {len(image_paths)} 张")
+            
+            # 标记开始处理
+            self._manifest.start_processing()
+            
+            # 步骤 3: 加载 AI 模型
+            self.log_message.emit("info", "")
+            self.log_message.emit("info", "🤖 [步骤 3/4] 加载 AI 模型...")
             self.started_loading.emit()
             
             set_thresholds(*self.thresholds)
@@ -123,15 +166,24 @@ class ScoringWorker(QThread):
             self._exif_writer = get_exif_writer()
             
             self.model_loaded.emit()
-            self.log_message.emit("info", "✅ AI 模型就绪")
+            self.log_message.emit("success", "   ✓ AI 模型就绪")
             
-            # 3. 处理图片
+            # 步骤 4: 开始评分
+            self.log_message.emit("info", "")
+            self.log_message.emit("info", "⭐ [步骤 4/4] AI 评分中...")
+            self.log_message.emit("info", f"   阈值: {self.thresholds[0]:.0f} / {self.thresholds[1]:.0f} / {self.thresholds[2]:.0f} / {self.thresholds[3]:.0f}")
+            self.log_message.emit("info", "")
+            
+            # 4. 处理图片
             results = []
             start_time = time.time()
+            total_to_process = len(image_paths)
             
             for i, image_path in enumerate(image_paths):
                 if self._should_stop:
                     self.log_message.emit("warning", "⚠️ 用户取消处理")
+                    # 中断时保存当前进度
+                    self._manifest.save()
                     break
                 
                 filename = os.path.basename(image_path)
@@ -140,13 +192,54 @@ class ScoringWorker(QThread):
                     result = self._process_single_image(image_path)
                     results.append(result)
                     
+                    # 更新 manifest
+                    self._manifest.add_file_result(
+                        filename=filename,
+                        file_path=image_path,
+                        quality=result.get("quality", 0),
+                        aesthetic=result.get("aesthetic", 0),
+                        total=result.get("total", 0),
+                        rating=result.get("rating", 0),
+                    )
+                    
+                    # 每处理 10 个文件保存一次 manifest（防止中断丢失）
+                    if (i + 1) % 10 == 0:
+                        self._manifest.save()
+                    
+                    # 计算时间估算
+                    elapsed = time.time() - start_time
+                    avg_time = elapsed / (i + 1)
+                    remaining = avg_time * (total_to_process - i - 1)
+                    
+                    # 格式化剩余时间
+                    if remaining >= 60:
+                        remaining_str = f"{int(remaining // 60)}分{int(remaining % 60)}秒"
+                    else:
+                        remaining_str = f"{int(remaining)}秒"
+                    
+                    # 显示分数和星级
+                    quality = result.get("quality", 0)
+                    aesthetic = result.get("aesthetic", 0)
+                    total = result.get("total", 0)
+                    rating = result.get("rating", 0)
+                    stars = "★" * rating + "☆" * (4 - rating)
+                    
+                    # 截短文件名
+                    short_name = filename[:28] + "..." if len(filename) > 31 else filename
+                    
+                    self.log_message.emit(
+                        "default",
+                        f"   [{i+1:3d}/{total_to_process}] {short_name:<31} "
+                        f"Q:{quality:.0f} A:{aesthetic:.0f} → {stars}  剩余: {remaining_str}"
+                    )
+                    
                     # 发送进度
                     self.progress.emit(
                         i + 1,
-                        len(image_paths),
+                        total_to_process,
                         filename,
-                        result.get("total", 0),
-                        result.get("rating", 0)
+                        total,
+                        rating
                     )
                     
                 except Exception as e:
@@ -210,45 +303,175 @@ class ScoringWorker(QThread):
             elapsed_time = time.time() - start_time
             summary = self._calculate_summary(results, elapsed_time)
             
-            self.log_message.emit("success", f"✅ 完成! 耗时 {elapsed_time:.1f}s")
+            # 显示完成摘要
+            self.log_message.emit("info", "")
+            self.log_message.emit("info", "━" * 45)
+            self.log_message.emit("success", "✅ AI 评分完成!")
+            self.log_message.emit("info", "━" * 45)
+            
+            # 统计成功和失败
+            success_count = sum(1 for r in results if "error" not in r)
+            error_count = sum(1 for r in results if "error" in r)
+            
+            self.log_message.emit("info", f"   成功: {success_count} 张")
+            if error_count > 0:
+                self.log_message.emit("warning", f"   失败: {error_count} 张")
+            
+            if elapsed_time >= 60:
+                time_str = f"{int(elapsed_time // 60)}分{int(elapsed_time % 60)}秒"
+            else:
+                time_str = f"{elapsed_time:.1f}秒"
+            
+            if success_count > 0:
+                self.log_message.emit("info", f"   总耗时: {time_str} ({elapsed_time/success_count:.2f}秒/张)")
+            else:
+                self.log_message.emit("info", f"   总耗时: {time_str}")
+            
+            self.log_message.emit("info", f"   已保存 manifest: .superelite_manifest.json")
+            
+            # 如果有错误，显示错误汇总
+            if error_count > 0:
+                self.log_message.emit("info", "")
+                self.log_message.emit("warning", f"⚠️ 失败文件汇总 ({error_count} 个):")
+                # 只显示前 10 个
+                error_files = [r for r in results if "error" in r][:10]
+                for r in error_files:
+                    short_err = r["error"][:50] + "..." if len(r["error"]) > 50 else r["error"]
+                    self.log_message.emit("error", f"   • {r['filename']}: {short_err}")
+                if error_count > 10:
+                    self.log_message.emit("warning", f"   ... 还有 {error_count - 10} 个文件失败")
+            
             self.finished_scoring.emit(results, summary)
             
         except Exception as e:
             self.error.emit(str(e))
     
     def _scan_directory(self, directory: str) -> List[str]:
-        """扫描目录下的图片文件"""
+        """
+        扫描目录下的图片文件（只扫描顶层目录，不进入子目录）
+        
+        注意：
+        1. 只扫描用户选择目录的顶层文件
+        2. 不进入用户原有的子目录（保护用户文件结构）
+        3. 如果 RAW 和 JPG 同名存在，只返回 RAW（处理时会自动使用 JPG 评分）
+        """
         supported_extensions = {
+            # 常见图片格式
             ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp",
-            ".arw", ".cr2", ".cr3", ".nef", ".dng", ".orf", ".rw2", ".raf"
+            # 主流相机 RAW 格式
+            ".arw", ".cr2", ".cr3", ".nef", ".dng", ".orf", ".rw2", ".raf",
+            # 小众相机 RAW 格式
+            ".3fr", ".iiq", ".rwl", ".srw", ".x3f", ".pef", ".erf", ".kdc", ".dcr", ".mrw", ".fff",
         }
         
-        image_paths = []
+        raw_extensions = {
+            ".arw", ".cr2", ".cr3", ".nef", ".dng", ".orf", ".rw2", ".raf",
+            ".3fr", ".iiq", ".rwl", ".srw", ".x3f", ".pef", ".erf", ".kdc", ".dcr", ".mrw", ".fff",
+        }
+        
+        jpg_extensions = {".jpg", ".jpeg"}
+        
+        # 只扫描顶层目录（不递归）
+        all_files = []
         dir_path = Path(directory)
         
-        for f in dir_path.iterdir():
+        for f in dir_path.iterdir():  # 改为 iterdir，不递归
+            # 跳过隐藏文件和目录
+            if f.name.startswith("."):
+                continue
+            # 跳过子目录（不进入）
+            if f.is_dir():
+                continue
             if f.is_file() and f.suffix.lower() in supported_extensions:
-                image_paths.append(str(f))
+                all_files.append(f)
+        
+        # 收集所有 RAW 文件的基名（不区分大小写）
+        raw_basenames = set()
+        for f in all_files:
+            if f.suffix.lower() in raw_extensions:
+                raw_basenames.add(f.stem.lower())
+        
+        # 过滤掉有配对 RAW 的 JPG
+        image_paths = []
+        for f in all_files:
+            if f.suffix.lower() in jpg_extensions:
+                if f.stem.lower() in raw_basenames:
+                    # 跳过有配对 RAW 的 JPG
+                    continue
+            image_paths.append(str(f))
         
         return sorted(image_paths)
     
     def _process_single_image(self, image_path: str) -> Dict:
-        """处理单张图片"""
+        """
+        处理单张图片
+        
+        处理逻辑:
+        1. RAW + 同名 JPG → 用 JPG 评分，EXIF 写入两者
+        2. RAW 无同名 JPG → 提取内嵌预览评分
+        3. 纯 JPG → 直接评分
+        4. 所有图片统一缩放到长边 672px 后评分
+        """
         filename = os.path.basename(image_path)
-        temp_file = None
+        temp_files = []  # 需要清理的临时文件
+        related_files = [image_path]  # 需要写入 EXIF 的文件列表
         
         try:
-            # 处理 RAW 文件 - 需要先提取预览
-            if is_raw_file(image_path):
-                temp_file = raw_to_jpeg(image_path)
-                if temp_file:
-                    score_path = temp_file
-                else:
-                    raise Exception("无法提取 RAW 预览")
-            else:
-                score_path = image_path
+            from PIL import Image
+            import tempfile
             
-            # 评分 - 使用正确的方法 score_image(path)
+            # 确定用于评分的源图片
+            if is_raw_file(image_path):
+                # 检查是否有同名 JPG
+                paired_jpg = find_paired_jpg(image_path)
+                if paired_jpg:
+                    # 有同名 JPG：用 JPG 评分，写入两者
+                    source_path = paired_jpg
+                    related_files.append(paired_jpg)
+                else:
+                    # 无同名 JPG：提取 RAW 内嵌预览
+                    extracted = raw_to_jpeg(image_path)
+                    if extracted:
+                        source_path = extracted
+                        temp_files.append(extracted)
+                    else:
+                        raise Exception("无法提取 RAW 预览")
+            else:
+                # 非 RAW 文件（JPG/TIFF 等）
+                source_path = image_path
+            
+            # 打开并缩放图片到长边 672px
+            img = Image.open(source_path)
+            img = img.convert('RGB')  # 确保 RGB 模式
+            
+            max_edge = 672
+            width, height = img.size
+            
+            if width > max_edge or height > max_edge:
+                # 需要缩小
+                if width > height:
+                    new_width = max_edge
+                    new_height = int(height * max_edge / width)
+                else:
+                    new_height = max_edge
+                    new_width = int(width * max_edge / height)
+                
+                img = img.resize((new_width, new_height), Image.LANCZOS)
+            
+            # 保存缩放后的临时文件
+            base_name = os.path.splitext(os.path.basename(image_path))[0]
+            temp_jpg = os.path.join(
+                tempfile.gettempdir(),
+                f'_superelite_resized_{base_name}.jpg'
+            )
+            img.save(temp_jpg, 'JPEG', quality=90)
+            temp_files.append(temp_jpg)
+            
+            # 关闭图片释放内存
+            img.close()
+            
+            # 用缩放后的图片评分
+            score_path = temp_jpg
             score_result = self._scorer.score_image(score_path)
             
             return {
@@ -258,30 +481,40 @@ class ScoringWorker(QThread):
                 "aesthetic": score_result.get("aesthetic", 0),
                 "total": score_result.get("total", 0),
                 "rating": score_result.get("rating", 0),
+                "related_files": related_files,  # 用于写入 EXIF
             }
             
         finally:
-            if temp_file and os.path.exists(temp_file):
-                os.remove(temp_file)
+            # 清理所有临时文件
+            for temp_file in temp_files:
+                if temp_file and os.path.exists(temp_file):
+                    try:
+                        os.remove(temp_file)
+                    except:
+                        pass
     
     def _write_xmp_metadata(self, results: List[Dict]):
-        """写入 XMP 元数据（包含质量分/美学分/总分）"""
+        """写入 XMP 元数据（包含质量分/美学分/总分）到所有关联文件"""
         for result in results:
             if "error" in result:
                 continue
             
-            try:
-                # 使用新方法写入完整评分
-                # 质量分→城市, 美学分→省份, 总分→国家, 星级→Rating
-                self._exif_writer.write_full_scoring_metadata(
-                    result["path"],
-                    quality_score=result.get("quality", 0),
-                    aesthetic_score=result.get("aesthetic", 0),
-                    total_score=result.get("total", 0),
-                    rating=result.get("rating", 0)
-                )
-            except Exception as e:
-                self.log_message.emit("warning", f"XMP 写入失败: {result['filename']}")
+            # 获取需要写入的所有文件（包括 RAW+JPG 配对）
+            related_files = result.get("related_files", [result["path"]])
+            
+            for file_path in related_files:
+                try:
+                    # 使用新方法写入完整评分
+                    # 质量分→城市, 美学分→省份, 总分→国家, 星级→Rating
+                    self._exif_writer.write_full_scoring_metadata(
+                        file_path,
+                        quality_score=result.get("quality", 0),
+                        aesthetic_score=result.get("aesthetic", 0),
+                        total_score=result.get("total", 0),
+                        rating=result.get("rating", 0)
+                    )
+                except Exception as e:
+                    self.log_message.emit("warning", f"XMP 写入失败: {os.path.basename(file_path)}")
     
     def _organize_by_rating(self, results: List[Dict]):
         """按星级整理文件到原目录内的子目录"""
@@ -329,62 +562,13 @@ class ScoringWorker(QThread):
                     ])
     
     def _save_manifest(self, results: List[Dict]):
-        """保存 manifest 文件到源目录"""
-        import json
-        from datetime import datetime
+        """完成并保存 manifest 文件"""
+        if self._manifest is None:
+            return
         
-        manifest_path = Path(self.input_dir) / ".superelite_manifest.json"
-        
-        # 构建 manifest 数据
-        manifest = {
-            "version": "1.0",
-            "app": "SuperElite",
-            "created": datetime.now().isoformat(),
-            "source_dir": self.input_dir,
-            "settings": {
-                "preset": "auto" if self.auto_calibrate else "custom",
-                "thresholds": list(self.thresholds),
-                "quality_weight": self.quality_weight,
-                "aesthetic_weight": self.aesthetic_weight,
-            },
-            "statistics": {
-                "total": len(results),
-                "success": sum(1 for r in results if "error" not in r),
-                "by_rating": {}
-            },
-            "files": []
-        }
-        
-        # 统计星级分布
-        for r in results:
-            if "error" not in r:
-                rating = r.get("rating", 0)
-                manifest["statistics"]["by_rating"][str(rating)] = \
-                    manifest["statistics"]["by_rating"].get(str(rating), 0) + 1
-        
-        # 记录每个文件
-        for r in results:
-            if "error" not in r:
-                file_info = {
-                    "filename": r["filename"],
-                    "original_path": r["path"],
-                    "organized_path": r.get("organized_path"),
-                    "scores": {
-                        "quality": round(r.get("quality", 0), 1),
-                        "aesthetic": round(r.get("aesthetic", 0), 1),
-                        "total": round(r.get("total", 0), 1),
-                    },
-                    "rating": r.get("rating", 0)
-                }
-                manifest["files"].append(file_info)
-        
-        # 写入文件
-        try:
-            with open(manifest_path, 'w', encoding='utf-8') as f:
-                json.dump(manifest, f, ensure_ascii=False, indent=2)
-            self.log_message.emit("info", f"📋 已保存 manifest: {manifest_path.name}")
-        except Exception as e:
-            self.log_message.emit("warning", f"Manifest 保存失败: {e}")
+        # 标记处理完成
+        self._manifest.complete_processing()
+        self.log_message.emit("info", f"📋 已保存 manifest: {MANIFEST_FILENAME}")
     
     
     def _calculate_percentile_thresholds(self, results: List[Dict]) -> Optional[Tuple[float, float, float, float]]:
@@ -433,6 +617,7 @@ class ScoringWorker(QThread):
             "success": len(success_results),
             "failed": len(results) - len(success_results),
             "by_rating": by_rating,
+            "scores": scores,  # 所有成功文件的分数列表
             "avg_score": sum(scores) / len(scores) if scores else 0,
             "max_score": max(scores) if scores else 0,
             "min_score": min(scores) if scores else 0,

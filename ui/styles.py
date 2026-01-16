@@ -504,10 +504,12 @@ QFrame[frameShape="5"] {{
 TITLE_STYLE = f"""
 QLabel {{
     color: {COLORS['text_primary']};
-    font-size: 18px;
+    font-size: 28px;
     font-weight: 600;
     letter-spacing: -0.5px;
     background: transparent;
+    margin: 0;
+    padding: 0;
 }}
 """
 
@@ -518,6 +520,8 @@ QLabel {{
     font-size: 12px;
     font-weight: 400;
     background: transparent;
+    margin: 0;
+    padding: 0;
 }}
 """
 

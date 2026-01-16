@@ -110,6 +110,8 @@ class SuperEliteMainWindow(QMainWindow):
         self._organize = True  # 默认启用分目录
         self._last_preset_index = 0  # 预设下拉菜单选中索引 (0=auto)
         
+
+        
         # 启动时预加载模型
         self._start_model_preload()
 
@@ -188,7 +190,8 @@ class SuperEliteMainWindow(QMainWindow):
         
         # 品牌名
         brand_layout = QVBoxLayout()
-        brand_layout.setSpacing(4)
+        brand_layout.setSpacing(0)
+        brand_layout.setContentsMargins(0, 0, 0, 0)
         
         # 主标题 - 中文
         title = QLabel("摄影评片")
@@ -272,10 +275,10 @@ class SuperEliteMainWindow(QMainWindow):
         # 预设下拉菜单
         self.preset_combo = QComboBox()
         self.preset_combo.addItems([
-            "auto (全自动20%均分)",
-            "default (默认: 78/72/66/58)",
-            "strict (严格: 85/80/75/70)",
-            "relaxed (宽松: 70/60/50/40)",
+            "全自动 (20% 均分)",
+            "默认 (78 / 72 / 66 / 58)",
+            "严格 (85 / 80 / 75 / 70)",
+            "宽松 (70 / 60 / 50 / 40)",
             "自定义..."
         ])
         self.preset_combo.setCurrentIndex(0)  # 默认选中全自动
@@ -334,6 +337,8 @@ class SuperEliteMainWindow(QMainWindow):
         
         parent_layout.addLayout(layout)
 
+
+
     # ==================== 日志区域 ====================
     def _create_log_section(self, parent_layout):
         """创建日志区域"""
@@ -391,7 +396,7 @@ class SuperEliteMainWindow(QMainWindow):
 
     # ==================== 按钮区域 ====================
     def _create_button_section(self, parent_layout):
-        """创建按钮区域 - 重置在开始旁边"""
+        """创建按钮区域"""
         btn_layout = QHBoxLayout()
         btn_layout.setSpacing(12)
         
@@ -414,7 +419,6 @@ class SuperEliteMainWindow(QMainWindow):
         btn_layout.addWidget(self.start_btn)
         
         parent_layout.addLayout(btn_layout)
-
     # ==================== 事件处理 ====================
     def _browse_directory(self):
         """浏览目录"""
@@ -423,6 +427,11 @@ class SuperEliteMainWindow(QMainWindow):
         )
         if path:
             self.dir_input.setText(path)
+            
+            # 检测是否有 manifest 文件，自动弹出操作对话框
+            from manifest_manager import has_manifest, ManifestManager
+            if has_manifest(path):
+                self._show_manifest_dialog(path)
     
     def _on_preset_changed(self, index):
         """预设选择变化"""
@@ -486,6 +495,50 @@ class SuperEliteMainWindow(QMainWindow):
     def _on_organize_changed(self, state):
         """分目录开关变化"""
         self._organize = (state == Qt.Checked)
+    
+    def _show_manifest_dialog(self, dir_path: str) -> bool:
+        """
+        显示 manifest 操作对话框
+        
+        Returns:
+            True 如果用户选择了操作（非取消）
+        """
+        from manifest_manager import ManifestManager
+        from ui.manifest_action_dialog import ManifestActionDialog
+        
+        manifest = ManifestManager(dir_path)
+        summary = manifest.get_summary()
+        
+        dialog = ManifestActionDialog(
+            parent=self,
+            summary=summary,
+            is_in_progress=manifest.is_in_progress,
+            current_thresholds=self._thresholds,
+        )
+        
+        if dialog.exec():
+            action = dialog.get_action()
+            
+            if action == ManifestActionDialog.ACTION_CANCEL:
+                return False
+            
+            elif action == ManifestActionDialog.ACTION_RESET:
+                # 重置数据 - 直接执行完整重置流程（不再弹确认框）
+                self._execute_reset(dir_path)
+                return True
+            
+            elif action == ManifestActionDialog.ACTION_RERATE:
+                # 快速重评星（使用用户选择的阈值）
+                selected_thresholds = dialog.get_selected_thresholds()
+                self._perform_quick_rerate(dir_path, manifest, selected_thresholds)
+                return True
+            
+            elif action == ManifestActionDialog.ACTION_CONTINUE:
+                # 继续处理
+                self._configure_and_start_worker(dir_path)
+                return True
+        
+        return False
 
     def _on_start(self):
         """开始处理"""
@@ -502,7 +555,21 @@ class SuperEliteMainWindow(QMainWindow):
             StyledMessageBox.warning(self, "提示", "目录不存在，请重新选择")
             return
         
-        # 使用配置中的阈值（从设置对话框）
+        # 检测是否有 manifest（已处理过的目录）
+        from manifest_manager import has_manifest
+        
+        if has_manifest(dir_path):
+            # 使用共享的对话框处理逻辑
+            if self._show_manifest_dialog(dir_path):
+                return  # 已经处理了（重评星/重置/继续）
+            else:
+                return  # 用户取消
+        
+        # 正常处理流程（新目录）
+        self._configure_and_start_worker(dir_path)
+    
+    def _configure_and_start_worker(self, dir_path: str):
+        """配置 worker 并开始处理"""
         thresholds = self._thresholds
         
         # 配置 worker
@@ -513,13 +580,163 @@ class SuperEliteMainWindow(QMainWindow):
             aesthetic_weight=self._aesthetic_weight,
             write_xmp=self._write_xmp,
             organize=self._organize,
-            output_dir=dir_path,  # 直接在原目录内创建子目录
+            output_dir=dir_path,
             csv_path=None,
             auto_calibrate=self._auto_calibrate,
         )
         
         # 开始处理
         self._start_processing()
+    
+    def _perform_reset_and_process(self, dir_path: str):
+        """重置数据后重新处理"""
+        from exif_writer import get_exif_writer
+        from pathlib import Path
+        
+        exif_writer = get_exif_writer()
+        
+        # 扫描顶层文件
+        supported_extensions = {
+            ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp",
+            ".arw", ".cr2", ".cr3", ".nef", ".dng", ".orf", ".rw2", ".raf",
+            ".3fr", ".iiq", ".rwl", ".srw", ".x3f", ".pef", ".erf", ".kdc", ".dcr", ".mrw", ".fff"
+        }
+        
+        files = []
+        for f in Path(dir_path).iterdir():  # 只扫描顶层
+            # 跳过隐藏文件和子目录
+            if f.name.startswith(".") or f.is_dir():
+                continue
+            if f.is_file() and f.suffix.lower() in supported_extensions:
+                files.append(str(f))
+        
+        # 清除元数据
+        for file_path in files:
+            try:
+                exif_writer.reset_metadata(file_path)
+            except:
+                pass
+        
+        self._log("success", f"✅ 已重置 {len(files)} 个文件的元数据")
+        
+        # 继续处理
+        self._configure_and_start_worker(dir_path)
+    
+    def _perform_quick_rerate(self, dir_path: str, manifest, thresholds: tuple = None):
+        """使用缓存分数快速重评星"""
+        from exif_writer import get_exif_writer
+        from manifest_manager import quick_rerate
+        from PySide6.QtWidgets import QApplication
+        from pathlib import Path
+        
+        # 使用传入的阈值或默认阈值
+        if thresholds is None:
+            thresholds = self._thresholds
+        
+        # 清空日志
+        self.log_text.clear()
+        
+        # 显示任务信息
+        self._log("info", "━" * 45)
+        self._log("info", "⚡ 快速重评星")
+        self._log("info", "━" * 45)
+        self._log("info", f"📁 目录: {dir_path}")
+        self._log("info", "")
+        
+        # 步骤 1: 显示配置
+        self._log("info", "⚙️ [步骤 1/3] 加载配置...")
+        self._log("info", f"   新阈值: {thresholds[0]:.1f} / {thresholds[1]:.1f} / {thresholds[2]:.1f} / {thresholds[3]:.1f}")
+        self._log("info", f"   权重: 质量 {self._quality_weight:.0%} + 美学 {self._aesthetic_weight:.0%}")
+        self._log("info", "")
+        
+        # 初始化进度条
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+        self._set_status("重评星中", "accent")
+        
+        try:
+            # 步骤 2: 计算新星级
+            self._log("info", "🔄 [步骤 2/3] 读取缓存分数并计算新星级...")
+            self._log("info", "   请稍候...")
+            
+            # 强制更新 UI，让用户看到进度
+            from PySide6.QtWidgets import QApplication
+            QApplication.processEvents()
+            
+            results = quick_rerate(
+                directory=dir_path,
+                new_thresholds=thresholds,
+                quality_weight=self._quality_weight,
+                aesthetic_weight=self._aesthetic_weight,
+            )
+            
+            total = len(results)
+            self._log("success", f"   ✓ 读取了 {total} 个文件的缓存分数")
+            self._log("info", "")
+            
+            # 步骤 3: 写入 EXIF
+            self._log("info", "📝 [步骤 3/3] 写入新星级到 EXIF...")
+            exif_writer = get_exif_writer()
+            changed_count = 0
+            
+            for i, r in enumerate(results):
+                filename = r["filename"]
+                
+                # 查找文件（可能在子目录）
+                file_path = None
+                for f in Path(dir_path).rglob(filename):
+                    file_path = f
+                    break
+                
+                if file_path and file_path.exists():
+                    try:
+                        exif_writer.write_rating(str(file_path), r["new_rating"])
+                        
+                        # 只显示有变化的文件
+                        if r["changed"]:
+                            changed_count += 1
+                            stars_old = "★" * r["old_rating"] + "☆" * (4 - r["old_rating"])
+                            stars_new = "★" * r["new_rating"] + "☆" * (4 - r["new_rating"])
+                            self._log("default", f"   [{i+1:3d}/{total}] {filename[:35]:<35} {stars_old} → {stars_new}")
+                    except Exception as e:
+                        self._log("warning", f"   ⚠️ {filename}: {e}")
+                
+                # 更新进度
+                progress = int((i + 1) / total * 100)
+                self.progress_bar.setValue(progress)
+                self.progress_percent.setText(f"{progress}%")
+                
+                # 每 10 个文件刷新 UI
+                if (i + 1) % 10 == 0:
+                    QApplication.processEvents()
+            
+            # 完成
+            self.progress_bar.setValue(100)
+            self.progress_percent.setText("100%")
+            self._set_status("就绪", "success")
+            
+            self._log("info", "")
+            self._log("info", "━" * 45)
+            self._log("success", "✅ 快速重评星完成!")
+            self._log("info", "━" * 45)
+            self._log("info", f"   处理文件: {total} 个")
+            self._log("info", f"   星级变化: {changed_count} 个")
+            
+            # 显示新的分布
+            by_rating = {0: 0, 1: 0, 2: 0, 3: 0, 4: 0}
+            for r in results:
+                by_rating[r["new_rating"]] = by_rating.get(r["new_rating"], 0) + 1
+            
+            self._log("info", "")
+            self._log("info", "📊 新的星级分布:")
+            for star in range(4, -1, -1):
+                count = by_rating.get(star, 0)
+                bar = "█" * min(count, 30)
+                self._log("default", f"   {'★' * star}{'☆' * (4-star)}: {count:3d} {bar}")
+            
+        except Exception as e:
+            self._set_status("错误", "error")
+            self._log("error", f"❌ 重评星失败: {e}")
     
     def _setup_worker(self):
         """设置后台工作线程"""
@@ -545,7 +762,7 @@ class SuperEliteMainWindow(QMainWindow):
         self._set_status("模型加载中", "warning")
         self.progress_bar.setRange(0, 0)  # 不确定模式
         self.progress_percent.setText("⏳")
-        self._log("info", "🔄 正在预加载 AI 模型...")
+        self._log("info", "🔄 正在加载 选片模型...")
     
     def _on_preload_finished(self, success: bool):
         """预加载完成"""
@@ -556,13 +773,13 @@ class SuperEliteMainWindow(QMainWindow):
         
         if success:
             self._set_status("就绪", "success")
-            self._log("success", "✅ AI 模型加载完成，可以开始处理")
+            self._log("success", "✅ 选片模型 加载完成")
             # 启用按钮
             self.start_btn.setEnabled(True)
             self.reset_btn.setEnabled(True)
         else:
             self._set_status("模型加载失败", "error")
-            self._log("error", "❌ 模型加载失败")
+            self._log("error", "❌ 选片模型 加载失败")
     
     def _start_processing(self):
         """开始处理"""
@@ -627,7 +844,53 @@ class SuperEliteMainWindow(QMainWindow):
         self._log("info", f"   成功: {summary['success']} 张")
         self._log("info", f"   耗时: {summary['elapsed_time']:.1f}s ({summary['speed']:.2f}s/张)")
         self._log("info", "")
-        self._log("info", "各星级分布:")
+        
+        # 分数统计
+        if 'scores' in summary and summary['scores']:
+            scores = summary['scores']
+            max_score = max(scores)
+            min_score = min(scores)
+            avg_score = sum(scores) / len(scores)
+            self._log("info", "📊 分数统计:")
+            self._log("info", f"   最高分: {max_score:.1f}")
+            self._log("info", f"   最低分: {min_score:.1f}")
+            self._log("info", f"   平均分: {avg_score:.1f}")
+            self._log("info", "")
+            
+            # 10分区间分布
+            self._log("info", "📈 分数区间分布:")
+            intervals = {
+                "90-100": 0,
+                "80-89": 0,
+                "70-79": 0,
+                "60-69": 0,
+                "50-59": 0,
+                "40-49": 0,
+                "0-39": 0,
+            }
+            for s in scores:
+                if s >= 90:
+                    intervals["90-100"] += 1
+                elif s >= 80:
+                    intervals["80-89"] += 1
+                elif s >= 70:
+                    intervals["70-79"] += 1
+                elif s >= 60:
+                    intervals["60-69"] += 1
+                elif s >= 50:
+                    intervals["50-59"] += 1
+                elif s >= 40:
+                    intervals["40-49"] += 1
+                else:
+                    intervals["0-39"] += 1
+            
+            for interval, count in intervals.items():
+                bar = "█" * min(count, 30)
+                self._log("default", f"   {interval}: {count:3d} {bar}")
+            self._log("info", "")
+        
+        # 星级分布
+        self._log("info", "⭐ 星级分布:")
         for star in range(5, 0, -1):
             count = summary['by_rating'].get(star, 0)
             bar = "█" * min(count, 30)
@@ -685,6 +948,11 @@ class SuperEliteMainWindow(QMainWindow):
         if result != StyledMessageBox.Yes:
             return
         
+        # 执行重置
+        self._execute_reset(dir_path)
+    
+    def _execute_reset(self, dir_path: str):
+        """执行完整重置（核心逻辑）"""
         # 禁用按钮
         self.start_btn.setEnabled(False)
         self.reset_btn.setEnabled(False)
@@ -694,29 +962,73 @@ class SuperEliteMainWindow(QMainWindow):
         self.log_text.clear()
         
         # 执行清除
-        self._log("info", f"🧹 开始重置元数据: {dir_path}")
+        self._log("info", "━" * 45)
+        self._log("info", "🧹 开始完整重置")
+        self._log("info", "━" * 45)
+        self._log("info", f"📁 目标目录: {dir_path}")
+        self._log("info", "")
         
         import sys
         from pathlib import Path
         backend_path = Path(__file__).parent.parent / "backend"
         sys.path.insert(0, str(backend_path))
         from exif_writer import get_exif_writer
+        from manifest_manager import ManifestManager, has_manifest
         
+        # 步骤 1: 检测 manifest
+        self._log("info", "📋 [步骤 1/4] 检测处理记录...")
+        
+        if has_manifest(dir_path):
+            manifest = ManifestManager(dir_path)
+            summary = manifest.get_summary()
+            self._log("success", f"   ✓ 发现 manifest 文件")
+            self._log("info", f"   已处理: {summary.get('processed_files', 0)} 个文件")
+            self._log("info", "")
+            
+            # 步骤 2: 恢复文件位置
+            self._log("info", "📂 [步骤 2/4] 恢复文件位置...")
+            self._log("info", "   将文件从星级子目录移回顶层...")
+            restore_result = manifest.restore_files()
+            
+            if restore_result["moved"] > 0:
+                self._log("success", f"   ✓ 移动了 {restore_result['moved']} 个文件")
+            if restore_result["already_in_place"] > 0:
+                self._log("info", f"   ○ {restore_result['already_in_place']} 个文件已在原位")
+            if restore_result["failed"] > 0:
+                self._log("warning", f"   ✗ {restore_result['failed']} 个文件移动失败")
+            self._log("info", "")
+            
+            # 步骤 3: 删除 manifest
+            self._log("info", "🗑️ [步骤 3/4] 删除处理记录...")
+            manifest.delete()
+            self._log("success", "   ✓ 已删除 .superelite_manifest.json")
+            self._log("info", "")
+        else:
+            self._log("info", "   ○ 未发现 manifest 文件，跳过恢复步骤")
+            self._log("info", "")
+        
+        # 步骤 4: 清除 EXIF 元数据
+        self._log("info", "🏷️ [步骤 4/4] 清除 EXIF 元数据...")
         exif_writer = get_exif_writer()
         
-        # 扫描文件
+        # 扫描顶层目录的文件（不进入用户原有子目录）
+        self._log("info", "   扫描顶层目录图片文件...")
         supported_extensions = {
             ".jpg", ".jpeg", ".png", ".tiff", ".tif", ".bmp",
-            ".arw", ".cr2", ".cr3", ".nef", ".dng", ".orf", ".rw2", ".raf"
+            ".arw", ".cr2", ".cr3", ".nef", ".dng", ".orf", ".rw2", ".raf",
+            ".3fr", ".iiq", ".rwl", ".srw", ".x3f", ".pef", ".erf", ".kdc", ".dcr", ".mrw", ".fff"
         }
         
         files = []
-        for f in Path(dir_path).iterdir():
+        for f in Path(dir_path).iterdir():  # 只扫描顶层
+            # 跳过隐藏文件和子目录
+            if f.name.startswith(".") or f.is_dir():
+                continue
             if f.is_file() and f.suffix.lower() in supported_extensions:
                 files.append(str(f))
         
         if not files:
-            self._log("warning", "未找到图片文件")
+            self._log("warning", "   未找到图片文件")
             self.start_btn.setEnabled(True)
             self.reset_btn.setEnabled(True)
             self._set_status("就绪", "success")
@@ -767,7 +1079,13 @@ class SuperEliteMainWindow(QMainWindow):
         # 完成
         self.progress_bar.setValue(100)
         self.progress_percent.setText("100%")
-        self._log("success", f"\n✅ 重置完成! 成功: {success_count}/{total}")
+        
+        self._log("info", "")
+        self._log("info", "━" * 45)
+        self._log("success", "✅ 重置完成!")
+        self._log("info", "━" * 45)
+        self._log("info", f"   清除元数据: {success_count} / {total} 成功")
+        self._log("info", "   目录已恢复到初始状态")
         
         # 恢复按钮
         self.start_btn.setEnabled(True)

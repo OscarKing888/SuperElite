@@ -5,8 +5,11 @@ SuperElite / 摄影评片 - GUI 入口点
 PySide6 版本
 """
 
-import sys
+# 必须在所有 import 之前设置，抑制 HuggingFace tokenizers 警告
 import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+import sys
 
 # 修复 macOS PyInstaller 打包后的多进程问题
 import multiprocessing

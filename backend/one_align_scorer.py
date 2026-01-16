@@ -47,6 +47,36 @@ class OneAlignScorer:
             return "cpu"
 
     @staticmethod
+    def _patch_transformers_compatibility():
+        """
+        修复 transformers 5.0+ 的兼容性问题
+        transformers 5.0 移除了一些旧版 API，需要手动恢复
+        """
+        try:
+            from transformers import pytorch_utils
+            
+            # 检查是否缺少 find_pruneable_heads_and_indices
+            if not hasattr(pytorch_utils, 'find_pruneable_heads_and_indices'):
+                # 手动定义这个函数（来自旧版 transformers）
+                def find_pruneable_heads_and_indices(heads, n_heads, head_dim, already_pruned_heads):
+                    """
+                    查找可修剪的头和相应索引
+                    """
+                    mask = torch.ones(n_heads, head_dim)
+                    heads = set(heads) - already_pruned_heads
+                    for head in heads:
+                        mask[head] = 0
+                    mask = mask.view(-1).contiguous().eq(1)
+                    index = torch.arange(len(mask))[mask].long()
+                    return heads, index
+                
+                # 注入到模块
+                pytorch_utils.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
+                print("[OneAlign] 已修复 transformers 5.0 兼容性 (find_pruneable_heads_and_indices)")
+        except Exception as e:
+            print(f"[OneAlign] 警告: transformers 兼容性补丁失败 ({e})")
+
+    @staticmethod
     def _patch_llama_rotary_embedding():
         """
         修复 LlamaRotaryEmbedding 与 transformers 4.40+ 的兼容性问题
@@ -103,6 +133,9 @@ class OneAlignScorer:
 
         from transformers import AutoModel
 
+        # 修复 transformers 5.0+ 兼容性问题
+        self._patch_transformers_compatibility()
+        
         # 修复 LlamaRotaryEmbedding 与 transformers 4.40 的兼容性问题
         self._patch_llama_rotary_embedding()
 

@@ -241,10 +241,10 @@ def prepare_image(image_path: str) -> tuple[str, bool]:
     )
     extracted = raw_to_jpeg(image_path, temp_path)
 
-    # 调整到 1920px
+    # 调整到 1024px (统一尺寸)
     from PIL import Image
     img = Image.open(extracted)
-    max_size = 1920
+    max_size = 1024
     w, h = img.size
     if w > max_size or h > max_size:
         ratio = min(max_size / w, max_size / h)

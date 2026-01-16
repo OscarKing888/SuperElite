@@ -67,6 +67,7 @@ def is_raw_file(file_path: str) -> bool:
         True 如果是 RAW 文件，否则 False
     """
     raw_extensions = {
+        # 主流相机
         '.nef',   # Nikon
         '.cr2',   # Canon
         '.cr3',   # Canon (新格式)
@@ -76,10 +77,49 @@ def is_raw_file(file_path: str) -> bool:
         '.dng',   # Adobe/通用
         '.raf',   # Fujifilm
         '.raw',   # 通用
+        # 小众相机
+        '.3fr',   # Hasselblad
+        '.iiq',   # Phase One
+        '.rwl',   # Leica
+        '.srw',   # Samsung
+        '.x3f',   # Sigma
+        '.pef',   # Pentax
+        '.erf',   # Epson
+        '.kdc',   # Kodak
+        '.dcr',   # Kodak
+        '.mrw',   # Minolta
+        '.fff',   # Imacon/Hasselblad
     }
 
     ext = os.path.splitext(file_path)[1].lower()
     return ext in raw_extensions
+
+
+def find_paired_jpg(raw_path: str) -> str:
+    """
+    查找 RAW 文件对应的同名 JPG（不区分大小写）
+
+    Args:
+        raw_path: RAW 文件路径
+
+    Returns:
+        同名 JPG 路径，如果不存在返回 None
+    """
+    directory = os.path.dirname(raw_path)
+    base_name = os.path.splitext(os.path.basename(raw_path))[0].lower()
+    
+    jpg_extensions = ['.jpg', '.jpeg']
+    
+    # 遍历目录查找匹配的 JPG
+    try:
+        for filename in os.listdir(directory):
+            name, ext = os.path.splitext(filename)
+            if name.lower() == base_name and ext.lower() in jpg_extensions:
+                return os.path.join(directory, filename)
+    except Exception:
+        pass
+    
+    return None
 
 
 def scan_raw_files(directory: str, recursive: bool = False) -> list:
