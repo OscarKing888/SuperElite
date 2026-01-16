@@ -100,6 +100,7 @@ class SuperEliteMainWindow(QMainWindow):
         # 状态
         self._is_processing = False
         self._model_loaded = False  # 模型是否已加载
+        self._is_downloading = False  # 是否正在下载模型
         
         # 配置（从设置对话框传入）
         self._quality_weight = 0.4
@@ -110,10 +111,136 @@ class SuperEliteMainWindow(QMainWindow):
         self._organize = True  # 默认启用分目录
         self._last_preset_index = 0  # 预设下拉菜单选中索引 (0=auto)
         
-
+        # 系统检查和模型下载
+        if not self._check_system_requirements():
+            return  # 会在 show 时显示错误
+        
+        if not self._check_and_download_model():
+            return  # 用户取消了下载
         
         # 启动时预加载模型
         self._start_model_preload()
+    
+    def _check_system_requirements(self) -> bool:
+        """检查系统要求"""
+        try:
+            from pathlib import Path
+            import sys
+            backend_path = Path(__file__).parent.parent / "backend"
+            sys.path.insert(0, str(backend_path))
+            
+            from region_detector import check_system_requirements, get_system_memory_gb
+            
+            passed, error_msg = check_system_requirements()
+            
+            if not passed:
+                memory = get_system_memory_gb()
+                StyledMessageBox.critical(
+                    self,
+                    "系统要求不满足",
+                    f"您的系统内存为 {memory:.1f}GB\n\n"
+                    f"SuperElite 需要至少 16GB 内存才能运行 AI 模型。\n\n"
+                    f"请关闭其他应用程序或升级硬件后重试。"
+                )
+                return False
+            
+            return True
+        except Exception as e:
+            self._log("warning", f"⚠️ 系统检查失败: {e}")
+            return True  # 检查失败时继续
+    
+    def _check_and_download_model(self) -> bool:
+        """检查模型是否已下载，如未下载则引导用户下载"""
+        try:
+            from pathlib import Path
+            import sys
+            backend_path = Path(__file__).parent.parent / "backend"
+            sys.path.insert(0, str(backend_path))
+            
+            from region_detector import is_model_cached, get_recommended_endpoint
+            
+            if is_model_cached():
+                self._log("info", "✅ AI 模型已就绪")
+                return True
+            
+            # 模型未下载，显示下载对话框
+            from ui.download_source_dialog import DownloadSourceDialog
+            
+            _, _, is_china = get_recommended_endpoint()
+            
+            dialog = DownloadSourceDialog(
+                recommended_is_china=is_china,
+                parent=self
+            )
+            
+            if not dialog.exec():
+                # 用户取消
+                StyledMessageBox.information(
+                    self,
+                    "需要下载模型",
+                    "SuperElite 需要 AI 模型才能运行。\n\n"
+                    "您可以稍后重新启动程序进行下载。"
+                )
+                return False
+            
+            # 开始下载
+            endpoint = dialog.get_selected_endpoint()
+            self._start_model_download(endpoint)
+            return True
+            
+        except Exception as e:
+            self._log("warning", f"⚠️ 模型检查失败: {e}")
+            return True  # 检查失败时继续
+    
+    def _start_model_download(self, endpoint: str):
+        """启动模型下载"""
+        from backend.model_downloader import ModelDownloader
+        
+        self._is_downloading = True
+        self._set_status("模型下载中", "warning")
+        self._log("info", "")
+        self._log("info", "📥 开始下载 AI 模型...")
+        self._log("info", f"   下载源: {endpoint}")
+        self._log("info", "   支持断点续传，可随时关闭程序")
+        self._log("info", "")
+        
+        self._downloader = ModelDownloader(endpoint, self)
+        self._downloader.progress.connect(self._on_download_progress)
+        self._downloader.log_message.connect(self._on_download_log)
+        self._downloader.finished.connect(self._on_download_finished)
+        self._downloader.start()
+    
+    def _on_download_log(self, log_type: str, message: str):
+        """下载日志"""
+        self._log(log_type, message)
+    
+    def _on_download_progress(self, percent: int, desc: str):
+        """下载进度更新"""
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(percent)
+        self.progress_percent.setText(f"{percent}%")
+        if desc:
+            self._set_status(f"下载: {desc}", "warning")
+    
+    def _on_download_finished(self, success: bool, message: str):
+        """下载完成"""
+        self._is_downloading = False
+        
+        if success:
+            self._log("success", "✅ 模型下载完成")
+            self.progress_bar.setValue(100)
+            self.progress_percent.setText("100%")
+            # 继续加载模型
+            self._start_model_preload()
+        else:
+            self._log("error", f"❌ 模型下载失败: {message}")
+            self._set_status("下载失败", "error")
+            StyledMessageBox.warning(
+                self,
+                "下载失败",
+                f"模型下载失败:\n{message}\n\n"
+                f"请检查网络连接或更换下载源后重试。"
+            )
 
     def _setup_window(self):
         """设置窗口属性"""
