@@ -1,0 +1,45 @@
+# SuperPicky 依赖包
+# Python 版本要求: 3.12+
+#
+# 使用虚拟环境:
+#   创建: python3.12 -m venv .venv
+#   激活: source .venv/bin/activate
+#   安装依赖: pip install -r requirements.txt
+#
+# 或直接使用虚拟环境路径:
+#   .venv/bin/python superpicky_cli.py
+
+# 核心依赖
+ultralytics>=8.0.0
+opencv-python>=4.0.0
+rawpy>=0.18.0
+imageio>=2.0.0
+numpy>=1.20.0
+Pillow>=9.0.0
+
+# UI 框架 (PySide6 分支)
+PySide6>=6.6.0
+
+# AI模型相关
+timm>=0.9.0
+cryptography>=41.0.0
+# One-Align 区域检测模型 (HuggingFace)
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.40.0
+accelerate>=0.20.0
+sentencepiece>=0.1.99
+protobuf>=3.20.0
+huggingface_hub>=0.20.0
+icecream>=2.1.0
+
+flask>=3.1.2
+flask_cors>=6.0.2
+
+# 说明：
+# - PySide6: Qt6 GUI 框架，替代 Tkinter
+# - Pillow: 必需，用于图片处理
+# - timm: 用于AI模型
+# - cryptography: 用于加密和安全功能
+
+imagehash

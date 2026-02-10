@@ -1,17 +1,19 @@
 """
-SuperElite - One-Align 评分器
-基于 q-future/one-align 的双维度图像评分 (质量 + 美学)
+SuperElite - One-Align scorer
+Based on q-future/one-align (quality + aesthetics).
 """
 
+import inspect
 import os
+from types import SimpleNamespace
+from typing import Dict, List, Optional, Tuple
+
 import torch
 from PIL import Image
-from typing import Dict, List, Tuple, Optional
-from pathlib import Path
 
 
 class OneAlignScorer:
-    """One-Align 评分器 - 双维度评估 (质量 + 美学)"""
+    """One-Align scorer: quality + aesthetics."""
 
     def __init__(
         self,
@@ -19,14 +21,6 @@ class OneAlignScorer:
         quality_weight: float = 0.4,
         aesthetic_weight: float = 0.6,
     ):
-        """
-        初始化评分器
-
-        Args:
-            model_path: 模型路径 (默认使用 HuggingFace 缓存)
-            quality_weight: 质量权重 (默认 0.4)
-            aesthetic_weight: 美学权重 (默认 0.6)
-        """
         self.model_path = model_path or "q-future/one-align"
         self.quality_weight = quality_weight
         self.aesthetic_weight = aesthetic_weight
@@ -38,30 +32,24 @@ class OneAlignScorer:
         print(f"[OneAlign] 权重: Quality={quality_weight}, Aesthetic={aesthetic_weight}")
 
     def _select_device(self) -> str:
-        """选择最优设备 (MPS 优先)"""
+        """Select best available device (MPS first)."""
         if torch.backends.mps.is_available():
             return "mps"
-        elif torch.cuda.is_available():
+        if torch.cuda.is_available():
             return "cuda"
-        else:
-            return "cpu"
+        return "cpu"
 
     @staticmethod
     def _patch_transformers_compatibility():
         """
-        修复 transformers 5.0+ 的兼容性问题
-        transformers 5.0 移除了一些旧版 API，需要手动恢复
+        transformers 5.x removed some legacy APIs used by One-Align remote code.
         """
         try:
             from transformers import pytorch_utils
-            
-            # 检查是否缺少 find_pruneable_heads_and_indices
-            if not hasattr(pytorch_utils, 'find_pruneable_heads_and_indices'):
-                # 手动定义这个函数（来自旧版 transformers）
+
+            if not hasattr(pytorch_utils, "find_pruneable_heads_and_indices"):
+
                 def find_pruneable_heads_and_indices(heads, n_heads, head_dim, already_pruned_heads):
-                    """
-                    查找可修剪的头和相应索引
-                    """
                     mask = torch.ones(n_heads, head_dim)
                     heads = set(heads) - already_pruned_heads
                     for head in heads:
@@ -69,8 +57,7 @@ class OneAlignScorer:
                     mask = mask.view(-1).contiguous().eq(1)
                     index = torch.arange(len(mask))[mask].long()
                     return heads, index
-                
-                # 注入到模块
+
                 pytorch_utils.find_pruneable_heads_and_indices = find_pruneable_heads_and_indices
                 print("[OneAlign] 已修复 transformers 5.0 兼容性 (find_pruneable_heads_and_indices)")
         except Exception as e:
@@ -78,122 +65,282 @@ class OneAlignScorer:
 
     @staticmethod
     def _patch_llama_rotary_embedding():
-        """
-        修复 LlamaRotaryEmbedding 与 transformers 4.40+ 的兼容性问题
-
-        transformers 4.40+ 可能有不同的 API：
-        - 旧版: forward(self, x, seq_len=None)
-        - 某些版本: forward(self, x, position_ids=None)
-        
-        One-Align 模型内部可能使用不同的调用方式，需要适配
-        """
+        """Patch RoPE-related APIs for One-Align on modern transformers."""
         try:
-            from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
-            import inspect
+            import transformers.models.llama.modeling_llama as llama_modeling
 
-            # 检查原始 forward 的签名
-            sig = inspect.signature(LlamaRotaryEmbedding.forward)
-            params = list(sig.parameters.keys())
+            # 1) apply_rotary_pos_emb old signature compatibility
+            if hasattr(llama_modeling, "apply_rotary_pos_emb"):
+                original_apply = llama_modeling.apply_rotary_pos_emb
+                apply_sig = inspect.signature(original_apply)
+                if (
+                    "position_ids" not in apply_sig.parameters
+                    and not getattr(original_apply, "_one_align_compat", False)
+                ):
 
-            # 保存原始的 forward 方法
+                    def patched_apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
+                        # Old callers pass `position_ids` as the 5th positional arg.
+                        if isinstance(position_ids, int):
+                            unsqueeze_dim = position_ids
+                        return original_apply(q, k, cos, sin, unsqueeze_dim=unsqueeze_dim)
+
+                    patched_apply_rotary_pos_emb._one_align_compat = True
+                    llama_modeling.apply_rotary_pos_emb = patched_apply_rotary_pos_emb
+
+            # 2) LlamaRotaryEmbedding __init__/forward compatibility
+            LlamaRotaryEmbedding = llama_modeling.LlamaRotaryEmbedding
+
+            original_init = LlamaRotaryEmbedding.__init__
+            init_sig = inspect.signature(original_init)
+            if (
+                "config" in init_sig.parameters
+                and not getattr(original_init, "_one_align_compat", False)
+            ):
+
+                def patched_init(self, *args, **kwargs):
+                    # Old API: LlamaRotaryEmbedding(dim, max_position_embeddings=..., base=...)
+                    if args and isinstance(args[0], int):
+                        dim = args[0]
+                        max_pos = kwargs.pop("max_position_embeddings", 2048)
+                        base = float(kwargs.pop("base", 10000.0))
+                        device = kwargs.pop("device", None)
+                        compat_cfg = SimpleNamespace(
+                            max_position_embeddings=max_pos,
+                            rope_parameters={"rope_type": "default", "rope_theta": base},
+                            head_dim=dim,
+                            hidden_size=dim,
+                            num_attention_heads=1,
+                        )
+                        return original_init(self, compat_cfg, device=device)
+
+                    cfg = args[0] if args else kwargs.get("config")
+                    rope_params = getattr(cfg, "rope_parameters", None) if cfg is not None else None
+                    # Avoid mutating model config; build an adapter config when rope_parameters is missing.
+                    if cfg is not None and (not isinstance(rope_params, dict) or "rope_type" not in rope_params):
+                        max_pos = getattr(cfg, "max_position_embeddings", 2048)
+                        base = float(getattr(cfg, "rope_theta", 10000.0))
+                        dim = getattr(cfg, "head_dim", None)
+                        if dim is None:
+                            hidden_size = getattr(cfg, "hidden_size", None)
+                            num_heads = getattr(cfg, "num_attention_heads", 1) or 1
+                            dim = hidden_size // num_heads if hidden_size else 128
+                        compat_cfg = SimpleNamespace(
+                            max_position_embeddings=max_pos,
+                            rope_parameters={"rope_type": "default", "rope_theta": base},
+                            head_dim=dim,
+                            hidden_size=getattr(cfg, "hidden_size", dim),
+                            num_attention_heads=getattr(cfg, "num_attention_heads", 1),
+                        )
+                        if args:
+                            args = (compat_cfg,) + args[1:]
+                        else:
+                            kwargs["config"] = compat_cfg
+                    return original_init(self, *args, **kwargs)
+
+                patched_init._one_align_compat = True
+                LlamaRotaryEmbedding.__init__ = patched_init
+
             original_forward = LlamaRotaryEmbedding.forward
+            if not getattr(original_forward, "_one_align_compat", False):
+                forward_sig = inspect.signature(original_forward)
+                forward_params = list(forward_sig.parameters.keys())
 
-            if 'position_ids' in params:
-                # 新版 API：接受 position_ids
-                def patched_forward(self, x, position_ids=None, seq_len=None):
-                    """兼容：如果传入 seq_len，转换为 position_ids"""
-                    if seq_len is not None and position_ids is None:
-                        batch_size = x.shape[0]
-                        device = x.device
-                        position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
-                        position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-                    return original_forward(self, x, position_ids=position_ids)
-            else:
-                # 当前版本 API：只接受 seq_len
-                def patched_forward(self, x, position_ids=None, seq_len=None):
-                    """兼容：如果传入 position_ids，转换为 seq_len"""
-                    if seq_len is None and position_ids is not None:
-                        seq_len = position_ids.shape[-1]
-                    return original_forward(self, x, seq_len=seq_len)
+                if "position_ids" in forward_params:
 
-            # 应用补丁
-            LlamaRotaryEmbedding.forward = patched_forward
+                    def patched_forward(self, x, position_ids=None, seq_len=None):
+                        if seq_len is not None and position_ids is None:
+                            batch_size = x.shape[0]
+                            device = x.device
+                            position_ids = torch.arange(seq_len, dtype=torch.long, device=device)
+                            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
+                        return original_forward(self, x, position_ids=position_ids)
+
+                else:
+
+                    def patched_forward(self, x, position_ids=None, seq_len=None):
+                        if seq_len is None and position_ids is not None:
+                            seq_len = position_ids.shape[-1]
+                        return original_forward(self, x, seq_len=seq_len)
+
+                patched_forward._one_align_compat = True
+                LlamaRotaryEmbedding.forward = patched_forward
+
             print("[OneAlign] 已修复 LlamaRotaryEmbedding 兼容性")
 
         except ImportError:
-            # 如果没有 LlamaRotaryEmbedding，跳过补丁
             pass
         except Exception as e:
             print(f"[OneAlign] 警告: 补丁失败 ({e})，可能导致兼容性问题")
 
+    @staticmethod
+    def _patch_cache_compatibility():
+        """
+        One-Align remote `modeling_llama2.py` uses:
+        `from transformers.models.llama.modeling_llama import *`
+        but transformers 5.x has a very small __all__, causing NameError.
+        """
+        try:
+            from transformers.cache_utils import Cache
+
+            try:
+                import transformers.models.llama.modeling_llama as M
+
+                if not hasattr(M, "Cache"):
+                    M.Cache = Cache
+
+                if hasattr(M, "__all__"):
+                    extra = [
+                        n
+                        for n in (
+                            "Cache",
+                            "BaseModelOutputWithPast",
+                            "CausalLMOutputWithPast",
+                            "logger",
+                            "LlamaRotaryEmbedding",
+                            "apply_rotary_pos_emb",
+                            "repeat_kv",
+                            "LlamaMLP",
+                            "LlamaRMSNorm",
+                        )
+                        if hasattr(M, n) and n not in M.__all__
+                    ]
+                    if extra:
+                        M.__all__ = list(M.__all__) + extra
+            except ImportError:
+                pass
+
+            try:
+                import transformers.models.llama as llama_pkg
+
+                if not hasattr(llama_pkg, "Cache"):
+                    llama_pkg.Cache = Cache
+            except ImportError:
+                pass
+
+            print("[OneAlign] 已修复 Cache 兼容性 (transformers 5.x)")
+        except Exception as e:
+            print(f"[OneAlign] 警告: Cache 补丁失败 ({e})")
+
+    @staticmethod
+    def _patch_model_config(config):
+        """Patch old One-Align config fields for transformers 5.x."""
+        rope_scaling = getattr(config, "rope_scaling", None)
+        if isinstance(rope_scaling, dict):
+            rope_scaling = dict(rope_scaling)
+            rope_type = rope_scaling.get("type", rope_scaling.get("rope_type"))
+            if rope_type in (None, "default"):
+                # One-Align old code expects rope_scaling=None
+                config.rope_scaling = None
+            else:
+                rope_scaling["type"] = rope_type
+                if "factor" not in rope_scaling and "scaling_factor" in rope_scaling:
+                    rope_scaling["factor"] = rope_scaling["scaling_factor"]
+                config.rope_scaling = rope_scaling
+
+        # Required by transformers 5.x LlamaMLP
+        if not hasattr(config, "mlp_bias"):
+            config.mlp_bias = False
+
+        # Keep One-Align on eager attention path.
+        config._attn_implementation = "eager"
+        config.use_cache = False
+        return config
+
+    def _patch_loaded_model_compatibility(self):
+        """Patch runtime attributes on the loaded model instance."""
+        if not hasattr(self.model, "model"):
+            return
+
+        base_model = self.model.model
+
+        if not hasattr(base_model, "_use_flash_attention_2"):
+            base_model._use_flash_attention_2 = False
+        if not hasattr(base_model, "_use_sdpa"):
+            base_model._use_sdpa = False
+
+        # transformers 5.x removed get_head_mask; One-Align visual abstractor still calls it.
+        visual_abstractor = getattr(base_model, "visual_abstractor", None)
+        if visual_abstractor is not None and not hasattr(visual_abstractor, "get_head_mask"):
+
+            def _compat_get_head_mask(this, head_mask, num_hidden_layers, is_attention_chunked=False):
+                if head_mask is None:
+                    return [None] * num_hidden_layers
+                return head_mask
+
+            visual_abstractor.get_head_mask = _compat_get_head_mask.__get__(
+                visual_abstractor, visual_abstractor.__class__
+            )
+
     def load_model(self):
-        """加载 One-Align 模型"""
+        """Load One-Align model."""
         if self.model is not None:
             return
 
-        from transformers import AutoModel
+        from transformers import AutoConfig, AutoModel
 
-        # 修复 transformers 5.0+ 兼容性问题
         self._patch_transformers_compatibility()
-        
-        # 修复 LlamaRotaryEmbedding 与 transformers 4.40 的兼容性问题
+        self._patch_cache_compatibility()
         self._patch_llama_rotary_embedding()
 
         self.device = self._select_device()
         print(f"[OneAlign] 使用设备: {self.device}")
         print("[OneAlign] 正在加载模型 (首次约需 1-2 分钟)...")
 
-        # 根据设备选择dtype和加载方式
+        config = AutoConfig.from_pretrained(
+            self.model_path,
+            trust_remote_code=True,
+        )
+        config = self._patch_model_config(config)
+
         if self.device == "mps":
-            # MPS 需要使用 device_map="mps" 和 float16
             self.model = AutoModel.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.float16,
+                config=config,
+                dtype=torch.float16,
                 device_map="mps",
                 trust_remote_code=True,
             )
         elif self.device == "cuda":
             self.model = AutoModel.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.float16,
+                config=config,
+                dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True,
             )
         else:
             self.model = AutoModel.from_pretrained(
                 self.model_path,
-                torch_dtype=torch.float32,
+                config=config,
+                dtype=torch.float32,
                 device_map="cpu",
                 trust_remote_code=True,
             )
 
-        # 修复 One-Align 模型与 transformers 4.40 的兼容性问题
-        # 模型内部代码引用了这些属性，但新版 transformers 没有自动设置
-        if hasattr(self.model, 'model'):
-            if not hasattr(self.model.model, '_use_flash_attention_2'):
-                self.model.model._use_flash_attention_2 = False
-            if not hasattr(self.model.model, '_use_sdpa'):
-                self.model.model._use_sdpa = False
-            print("[OneAlign] 已修复 attention 兼容性")
+        self._patch_loaded_model_compatibility()
+        print("[OneAlign] 已修复 attention 兼容性")
 
-        # 设置为评估模式
         self.model.eval()
-
         print("[OneAlign] 模型加载成功")
+
+    @staticmethod
+    def _to_float_score(score_value) -> float:
+        if isinstance(score_value, (list, tuple)):
+            score_value = score_value[0]
+        if torch.is_tensor(score_value):
+            return float(score_value.detach().float().item())
+        return float(score_value)
 
     def score_image(self, image_path: str) -> Dict:
         """
-        评分单张图片
-
-        Args:
-            image_path: 图片路径
+        Score a single image.
 
         Returns:
             {
-                "quality": float,      # 质量分 (0-100)
-                "aesthetic": float,    # 美学分 (0-100)
-                "total": float,        # 综合分 (0-100)
-                "rating": int,         # 星级 (0-4)
+                "quality": float,      # 0-100
+                "aesthetic": float,    # 0-100
+                "total": float,        # 0-100
+                "rating": int,         # 0-4
                 "pick_flag": str,      # "picked" / "rejected" / ""
                 "color_label": str,    # "Green" / "Yellow" / "Red" / "Purple" / ""
             }
@@ -204,32 +351,24 @@ class OneAlignScorer:
         if self.model is None:
             self.load_model()
 
-        # 加载图片
         image = Image.open(image_path).convert("RGB")
 
         with torch.inference_mode():
-            # 质量评分 (One-Align 返回 0-5 分制)
             quality_score = self.model.score(
                 [image],
                 task_="quality",
                 input_="image",
             )
-            quality_raw = float(quality_score[0]) if isinstance(quality_score, list) else float(quality_score)
-            quality = quality_raw * 20  # 转换为 0-100 分制
+            quality = self._to_float_score(quality_score) * 20
 
-            # 美学评分 (One-Align 返回 0-5 分制)
             aesthetic_score = self.model.score(
                 [image],
                 task_="aesthetics",
                 input_="image",
             )
-            aesthetic_raw = float(aesthetic_score[0]) if isinstance(aesthetic_score, list) else float(aesthetic_score)
-            aesthetic = aesthetic_raw * 20  # 转换为 0-100 分制
+            aesthetic = self._to_float_score(aesthetic_score) * 20
 
-        # 综合评分 (已经是 0-100 分制)
         total = quality * self.quality_weight + aesthetic * self.aesthetic_weight
-
-        # 映射到星级和标签
         rating, pick_flag, color_label = self._map_to_rating(total)
 
         return {
@@ -242,15 +381,7 @@ class OneAlignScorer:
         }
 
     def score_batch(self, image_paths: List[str]) -> List[Dict]:
-        """
-        批量评分 (TODO: 真正的批量推理优化)
-
-        Args:
-            image_paths: 图片路径列表
-
-        Returns:
-            评分结果列表
-        """
+        """Score a list of images."""
         results = []
         for path in image_paths:
             try:
@@ -264,62 +395,33 @@ class OneAlignScorer:
     @staticmethod
     def _map_to_rating(total_score: float) -> Tuple[int, str, str]:
         """
-        映射综合分到星级、旗标、色标
-
-        Args:
-            total_score: 综合分 (0-100)
-
-        Returns:
-            (rating, pick_flag, color_label)
-
-        新阈值设计（0-4星，5星留给用户手动评级）：
-        - 4星 (≥78): AI最高评价，顶级照片，约包10-15%
-        - 3星 (≥72): 优秀照片，约包20-25%
-        - 2星 (≥66): 中等照片，约包30-40% (大部分照片)
-        - 1星 (≥58): 较低质量，约包15-20%
-        - 0星 (<58): 质量最低，但保留，约包10-15%
-
-        标签策略：
-        - 不使用 rejected 标记（所有照片都保留）
-        - 不使用 picked 标签和颜色标签
-        - 5星保留给用户手动评级
+        Map total score to rating/flags.
+        5 stars are reserved for manual user curation.
         """
         t4, t3, t2, t1 = _thresholds
-        
+
         if total_score >= t4:
             return 4, "", ""
-        elif total_score >= t3:
+        if total_score >= t3:
             return 3, "", ""
-        elif total_score >= t2:
+        if total_score >= t2:
             return 2, "", ""
-        elif total_score >= t1:
+        if total_score >= t1:
             return 1, "", ""
-        else:
-            return 0, "", ""  # 0星：质量最低，但不删除
+        return 0, "", ""
 
     def warmup(self):
-        """预热模型"""
+        """Warmup model."""
         if self.model is None:
             self.load_model()
 
 
-# 全局阈值配置
-_thresholds = (78.0, 72.0, 66.0, 58.0)  # (4星, 3星, 2星, 1星)
-
-# 全局单例
+_thresholds = (78.0, 72.0, 66.0, 58.0)
 _scorer_instance = None
 
 
 def set_thresholds(t4: float, t3: float, t2: float, t1: float):
-    """
-    设置自定义星级阈值
-    
-    Args:
-        t4: 4星阈值 (≥t4 为4星)
-        t3: 3星阈值 (≥t3 为3星)
-        t2: 2星阈值 (≥t2 为2星)
-        t1: 1星阈值 (≥t1 为1星，<t1 为0星)
-    """
+    """Set custom thresholds."""
     global _thresholds
     _thresholds = (t4, t3, t2, t1)
 
@@ -329,16 +431,14 @@ def get_one_align_scorer(
     quality_weight: float = 0.4,
     aesthetic_weight: float = 0.6,
 ) -> OneAlignScorer:
-    """获取评分器单例"""
+    """Get singleton scorer."""
     global _scorer_instance
-
     if _scorer_instance is None:
         _scorer_instance = OneAlignScorer(
             model_path=model_path,
             quality_weight=quality_weight,
             aesthetic_weight=aesthetic_weight,
         )
-
     return _scorer_instance
 
 
@@ -358,6 +458,6 @@ if __name__ == "__main__":
     print(f"质量分: {result['quality']:.2f}")
     print(f"美学分: {result['aesthetic']:.2f}")
     print(f"综合分: {result['total']:.2f}")
-    print(f"星级: {'⭐' * result['rating']} ({result['rating']}星)")
+    print(f"星级: {'*' * result['rating']} ({result['rating']}星)")
     print(f"旗标: {result['pick_flag'] or '-'}")
     print(f"色标: {result['color_label'] or '-'}")
